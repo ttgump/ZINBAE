@@ -214,7 +214,7 @@ if __name__ == "__main__":
 
 
     # Impute error
-    x_impute = zinbae_model.autoencoder.predict(x=[adata.X, adata.obs.size_factors])
+    x_impute = zinbae0_model.autoencoder.predict(x=[adata.X, adata.obs.size_factors])
 
     raw_error = imputate_error(adata.raw.X, true_count, x_raw=adata.raw.X)
     imputation_error = imputate_error(x_impute, true_count, x_raw=adata.raw.X)
