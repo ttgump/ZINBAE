@@ -123,8 +123,25 @@ class ZINB_AE(object):
         zinb = ZINB(pi, theta=disp, ridge_lambda=self.ridge, debug=self.debug)
         self.zinb_loss = zinb.loss 
 
-        self.model = Model(inputs=[self.autoencoder.input[0], self.autoencoder.input[1]],
-                           outputs=self.autoencoder.output)
+        # zero-inflated outputs
+        tau_input = Input(shape=(self.dims[0],), name='tau_input')
+        pi_ = self.autoencoder.get_layer('pi').output
+        mean_ = self.autoencoder.output
+
+        pi_log_ = Lambda(lambda x:tf.log(x+self.eps))(pi_)
+        nondrop_pi_log_ = Lambda(lambda x:tf.log(1-x+self.eps))(pi_)
+        pi_log_ = Reshape( target_shape=(self.dims[0],1) )(pi_log_)
+        nondrop_pi_log_ = Reshape( target_shape=(self.dims[0],1) )(nondrop_pi_log_)     
+        logits = Concatenate(axis=-1)([pi_log_,nondrop_pi_log_])
+        temp_ = RepeatVector( 2 )(tau_input)
+        temp_ = Permute( (2,1) )(temp_)
+        samples_ = Lambda( gumbel_softmax,output_shape=(self.dims[0],2,) )( [logits,temp_] )          
+        samples_ = Lambda( lambda x:x[:,:,1] )(samples_)
+        samples_ = Reshape( target_shape=(self.dims[0],) )(samples_)      
+        output_ = Multiply(name='ZI_output')([mean_, samples_])
+
+        self.model = Model(inputs=[self.autoencoder.input[0], self.autoencoder.input[1], tau_input],
+                           outputs=[output_, self.autoencoder.output])
 
     def pretrain(self, x, x_count, batch_size=256, epochs=200, optimizer='adam', ae_file='ae_weights.h5'):
         print('...Pretraining autoencoder...')
@@ -136,12 +153,8 @@ class ZINB_AE(object):
         self.pretrained = True
     
     def fit(self, x, x_count, batch_size=256, maxiter=2e3, ae_weights=None, 
-                loss_weights=0.1, optimizer='adam', model_file='model_weight.h5'):
-        def custom_loss(y_true, y_pred):
-            loss1 = mse_loss_v2(y_true, y_pred)
-            loss2 = self.zinb_loss(y_true, y_pred)
-            return loss1*loss_weights + loss2
-        self.model.compile(loss=custom_loss, optimizer=optimizer)
+                loss_weights=[0.01, 1], optimizer='adam', model_file='model_weight.h5'):
+        self.model.compile(loss={'ZI_output': mse_loss_v2, 'slice': self.zinb_loss}, loss_weights=loss_weights, optimizer=optimizer)
         if not self.pretrained and ae_weights is None:
             print('...pretraining autoencoders using default hyper-parameters:')
             print('   optimizer=\'adam\';   epochs=200')
@@ -151,7 +164,19 @@ class ZINB_AE(object):
             self.autoencoder.load_weights(ae_weights)
             print('ae_weights is loaded successfully.')
 
-        self.model.fit(x=[x[0], x[1]], y=x_count, batch_size=batch_size, epochs=maxiter, shuffle=True)
+        # anneal tau
+        tau0 = 1.
+        min_tau = 0.5
+        anneal_rate = 0.0003
+        tau = tau0
+#        es = EarlyStopping(monitor="loss", patience=20, verbose=1)
+        for e in range(maxiter):
+            if e % 100 == 0:
+                tau = max( tau0*np.exp( -anneal_rate * e),min_tau   )
+                tau_in = np.ones( x[0].shape,dtype='float32' ) * tau
+                print(tau)
+            print("Epoch %d/%d" % (e, maxiter))
+            self.model.fit(x=[x[0], x[1], tau_in], y=x_count, batch_size=batch_size, epochs=1, shuffle=True)
         self.model.save_weights(model_file)
 
 if __name__ == "__main__":
@@ -217,8 +242,8 @@ if __name__ == "__main__":
         zinbae_model.pretrain(x=[adata.X, adata.obs.size_factors], x_count=adata.raw.X, batch_size=args.batch_size, epochs=args.pretrain_epochs, 
                         optimizer=optimizer, ae_file=args.ae_weight_file)
 
-    zinbae_model.fit(x=[adata.X, adata.obs.size_factors], x_count=adata.raw.X, batch_size=args.batch_size, ae_weights=args.ae_weights,
-                    maxiter=args.max_iters, loss_weights=args.gamma, optimizer=optimizer, model_file=args.model_weight_file)
+    zinbae_model.fit(x=[adata.X, adata.obs.size_factors], x_count=[adata.raw.X, adata.raw.X], batch_size=args.batch_size, ae_weights=args.ae_weights,
+                    maxiter=args.max_iters, loss_weights=[args.gamma, 1], optimizer=optimizer, model_file=args.model_weight_file)
     # Impute error
     x_impute = zinbae_model.autoencoder.predict(x=[adata.X, adata.obs.size_factors])
 
